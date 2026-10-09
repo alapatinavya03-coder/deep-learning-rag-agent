@@ -25,6 +25,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # ---------------------------------------------------------------------------
 
 
+
 class LLMProvider(str, Enum):
     """Supported LLM backend providers."""
 
@@ -83,6 +84,9 @@ class Settings(BaseSettings):
     chroma_db_path: str = Field(default="./data/chroma_db", alias="CHROMA_DB_PATH")
     chroma_collection_name: str = Field(
         default="deep_learning_corpus", alias="CHROMA_COLLECTION_NAME"
+    )
+    ingestion_batch_size: int = Field(
+    default=100, ge=1, alias="INGESTION_BATCH_SIZE"
     )
 
     # Retrieval
@@ -166,17 +170,18 @@ class LLMFactory:
             raise ValueError(f"Unsupported LLM provider: {provider}")
 
     def _create_groq(self) -> BaseChatModel:
-        """
-        Create a Groq-backed chat model.
 
-        Requires GROQ_API_KEY in environment.
-        Recommended models: llama-3.1-8b-instant (fast), llama-3.1-70b-versatile (quality)
+        """Create a Groq-backed chat model."""
+        from langchain_groq import ChatGroq
 
-        Interview talking point: Groq uses LPU (Language Processing Unit)
-        inference for significantly lower latency than GPU-based inference.
-        """
-        # TODO: implement using langchain_groq.ChatGroq
-        raise NotImplementedError
+        api_key = self._settings.groq_api_key.strip()
+        if not api_key:
+            raise EnvironmentError("GROQ_API_KEY is missing from .env.")
+
+        return ChatGroq(
+            model=self._settings.groq_model,
+            api_key=api_key,
+        )
 
     def _create_ollama(self) -> BaseChatModel:
         """
@@ -255,18 +260,13 @@ class EmbeddingFactory:
             raise ValueError(f"Unsupported embedding provider: {provider}")
 
     def _create_local(self):
-        """
-        Create a local sentence-transformers embedding model.
+    
+        from langchain_community.embeddings import HuggingFaceEmbeddings
 
-        First run downloads the model (~90MB for all-MiniLM-L6-v2).
-        Subsequent runs load from cache. Use st.cache_resource or
-        equivalent to avoid reloading on every UI interaction.
-
-        Interview talking point: local embeddings mean the corpus content
-        never leaves the machine — important for proprietary datasets.
-        """
-        # TODO: implement using langchain_community.embeddings.HuggingFaceEmbeddings
-        raise NotImplementedError
+        return HuggingFaceEmbeddings(
+            model_name=self._settings.embedding_model,
+            model_kwargs={"device": "cpu"},
+        )
 
     def _create_openai(self):
         """

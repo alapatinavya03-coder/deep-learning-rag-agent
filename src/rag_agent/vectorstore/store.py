@@ -60,28 +60,33 @@ class VectorStoreManager:
     # -----------------------------------------------------------------------
 
     def _initialise(self) -> None:
-        """
-        Create or connect to the persistent ChromaDB client and collection.
+        """Connect to the persistent ChromaDB collection."""
+        import chromadb
 
-        Creates the chroma_db_path directory if it does not exist.
-        Uses PersistentClient so data survives between application restarts.
+        try:
+            db_path = Path(self._settings.chroma_db_path)
+            db_path.mkdir(parents=True, exist_ok=True)
 
-        Called automatically during __init__. Should not be called directly.
+            self._client = chromadb.PersistentClient(
+                path=str(db_path)
+            )
 
-        Raises
-        ------
-        RuntimeError
-            If ChromaDB cannot be initialised at the configured path.
-        """
-        # TODO: implement
-        # 1. Ensure Path(self._settings.chroma_db_path).mkdir(parents=True, exist_ok=True)
-        # 2. chromadb.PersistentClient(path=self._settings.chroma_db_path)
-        # 3. client.get_or_create_collection(
-        #        name=self._settings.chroma_collection_name,
-        #        metadata={"hnsw:space": "cosine"}   # cosine similarity
-        #    )
-        # 4. Log successful initialisation with collection name and item count
-        raise NotImplementedError
+            self._collection = self._client.get_or_create_collection(
+                name=self._settings.chroma_collection_name,
+                metadata={"hnsw:space": "cosine"},
+            )
+
+            logger.info(
+                "Collection '{}' initialized with {} chunks",
+                self._settings.chroma_collection_name,
+                self._collection.count(),
+            )
+
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to initialize ChromaDB at "
+                f"{self._settings.chroma_db_path}"
+            ) from exc
 
     # -----------------------------------------------------------------------
     # Duplicate Detection
@@ -112,75 +117,77 @@ class VectorStoreManager:
         return hashlib.sha256(content.encode()).hexdigest()[:16]
 
     def check_duplicate(self, chunk_id: str) -> bool:
-        """
-        Check whether a chunk with this ID already exists in the collection.
-
-        Parameters
-        ----------
-        chunk_id : str
-            The deterministic chunk ID to check.
-
-        Returns
-        -------
-        bool
-            True if the chunk already exists (duplicate). False otherwise.
-
-        Interview talking point: content-addressed deduplication is more
-        robust than filename-based deduplication because it detects identical
-        content even when files are renamed or re-uploaded.
-        """
-        # TODO: implement
-        # self._collection.get(ids=[chunk_id])
-        # Return True if the result contains the ID, False otherwise
-        raise NotImplementedError
+        result = self._collection.get(
+            ids=[chunk_id],
+            include=[],
+        )
+        return chunk_id in result["ids"]
 
     # -----------------------------------------------------------------------
     # Ingestion
     # -----------------------------------------------------------------------
 
     def ingest(self, chunks: list[DocumentChunk]) -> IngestionResult:
-        """
-        Embed and store a list of DocumentChunks in ChromaDB.
+        """Embed and store new chunks, skipping duplicates."""
+        result = IngestionResult()
+        seen_ids: set[str] = set()
+        pending: list[DocumentChunk] = []
 
-        Checks each chunk for duplicates before embedding. Skips duplicates
-        silently and records the count in the returned IngestionResult.
+        for chunk in chunks:
+            try:
+                if (
+                    chunk.chunk_id in seen_ids
+                    or self.check_duplicate(chunk.chunk_id)
+                ):
+                    result.skipped += 1
+                    continue
 
-        Parameters
-        ----------
-        chunks : list[DocumentChunk]
-            Prepared chunks with text and metadata. Use DocumentChunker
-            to produce these from raw files.
+                if not chunk.chunk_text.strip():
+                    raise ValueError("Chunk text is empty.")
 
-        Returns
-        -------
-        IngestionResult
-            Summary with counts of ingested, skipped, and errored chunks.
+                seen_ids.add(chunk.chunk_id)
+                pending.append(chunk)
 
-        Notes
-        -----
-        Embeds in batches of 100 to avoid memory issues with large corpora.
-        Uses upsert (not add) so re-ingestion of modified content updates
-        existing chunks rather than raising an error.
+            except Exception as exc:
+                result.errors.append(f"{chunk.chunk_id}: {exc}")
 
-        Interview talking point: batch processing with a configurable
-        batch size is a production pattern that prevents OOM errors when
-        ingesting large document sets.
-        """
-        # TODO: implement
-        # result = IngestionResult()
-        # For each chunk:
-        #   - check_duplicate(chunk.chunk_id) → if True, result.skipped += 1, continue
-        #   - embed chunk.chunk_text using self._embeddings.embed_documents([chunk.chunk_text])
-        #   - self._collection.upsert(
-        #         ids=[chunk.chunk_id],
-        #         embeddings=[embedding],
-        #         documents=[chunk.chunk_text],
-        #         metadatas=[chunk.metadata.to_dict()]
-        #     )
-        #   - result.ingested += 1
-        # Log summary and return result
-        raise NotImplementedError
+        batch_size = self._settings.ingestion_batch_size
 
+        for start in range(0, len(pending), batch_size):
+            batch = pending[start:start + batch_size]
+
+            try:
+                texts = [chunk.chunk_text for chunk in batch]
+                embeddings = self._embeddings.embed_documents(texts)
+
+                self._collection.upsert(
+                    ids=[chunk.chunk_id for chunk in batch],
+                    embeddings=embeddings,
+                    documents=texts,
+                    metadatas=[
+                        chunk.metadata.to_dict() for chunk in batch
+                    ],
+                )
+
+                result.ingested += len(batch)
+
+                for chunk in batch:
+                    source = chunk.metadata.source
+                    if source not in result.document_ids:
+                        result.document_ids.append(source)
+
+            except Exception as exc:
+                for chunk in batch:
+                    result.errors.append(f"{chunk.chunk_id}: {exc}")
+                logger.exception("Failed to ingest a chunk batch")
+
+        logger.info(
+            "Ingestion: {} ingested, {} skipped, {} errors",
+            result.ingested,
+            result.skipped,
+            len(result.errors),
+        )
+        return result
     # -----------------------------------------------------------------------
     # Retrieval
     # -----------------------------------------------------------------------
@@ -192,71 +199,99 @@ class VectorStoreManager:
         topic_filter: str | None = None,
         difficulty_filter: str | None = None,
     ) -> list[RetrievedChunk]:
-        """
-        Retrieve the top-k most relevant chunks for a query.
+        """Retrieve relevant chunks with optional metadata filters."""
+        if not query_text.strip():
+            return []
 
-        Applies similarity threshold filtering — chunks below
-        settings.similarity_threshold are excluded from results.
+        k = self._settings.retrieval_k if k is None else k
+        if k <= 0:
+            raise ValueError("k must be greater than zero.")
 
-        Parameters
-        ----------
-        query_text : str
-            The user query or rewritten query to retrieve against.
-        k : int, optional
-            Number of chunks to retrieve. Defaults to settings.retrieval_k.
-        topic_filter : str, optional
-            Restrict retrieval to a specific topic (e.g. 'LSTM').
-            Maps to ChromaDB where-filter on metadata.topic.
-        difficulty_filter : str, optional
-            Restrict retrieval to a difficulty level.
-            Maps to ChromaDB where-filter on metadata.difficulty.
+        total_chunks = self._collection.count()
+        if total_chunks == 0:
+            return []
 
-        Returns
-        -------
-        list[RetrievedChunk]
-            Chunks sorted by similarity score descending.
-            Empty list if no chunks meet the similarity threshold.
+        filters = []
 
-        Interview talking point: returning an empty list (not hallucinating)
-        when no relevant context exists is the hallucination guard. This is
-        a critical production RAG pattern — the system must know what it
-        does not know.
-        """
-        # TODO: implement
-        # k = k or self._settings.retrieval_k
-        # Build where_filter dict from topic_filter and difficulty_filter if provided
-        # Embed query_text using self._embeddings.embed_query(query_text)
-        # self._collection.query(
-        #     query_embeddings=[query_embedding],
-        #     n_results=k,
-        #     where=where_filter,      # None if no filters
-        #     include=["documents", "metadatas", "distances"]
-        # )
-        # Convert distances to similarity scores: score = 1 - distance (for cosine)
-        # Filter out chunks below self._settings.similarity_threshold
-        # Return list of RetrievedChunk objects sorted by score descending
-        raise NotImplementedError
+        if topic_filter:
+            filters.append({"topic": topic_filter})
+
+        if difficulty_filter:
+            filters.append({"difficulty": difficulty_filter})
+
+        where_filter = None
+        if len(filters) == 1:
+            where_filter = filters[0]
+        elif len(filters) > 1:
+            where_filter = {"$and": filters}
+
+        query_embedding = self._embeddings.embed_query(query_text)
+
+        results = self._collection.query(
+            query_embeddings=[query_embedding],
+            n_results=min(k, total_chunks),
+            where=where_filter,
+            include=["documents", "metadatas", "distances"],
+        )
+
+        retrieved: list[RetrievedChunk] = []
+
+        for chunk_id, text, metadata, distance in zip(
+            results["ids"][0],
+            results["documents"][0],
+            results["metadatas"][0],
+            results["distances"][0],
+        ):
+            score = 1.0 - float(distance)
+
+            if score < self._settings.similarity_threshold:
+                continue
+
+            retrieved.append(
+                RetrievedChunk(
+                    chunk_id=chunk_id,
+                    chunk_text=text,
+                    metadata=ChunkMetadata.from_dict(metadata),
+                    score=score,
+                )
+            )
+
+        return sorted(
+            retrieved,
+            key=lambda chunk: chunk.score,
+            reverse=True,
+        )
 
     # -----------------------------------------------------------------------
     # Corpus Inspection
     # -----------------------------------------------------------------------
 
     def list_documents(self) -> list[dict]:
-        """
-        Return a list of all unique source documents in the collection.
+        """List source documents and their chunk counts."""
+        results = self._collection.get(include=["metadatas"])
+        documents = {}
 
-        Used by the UI to populate the document viewer panel.
+        for metadata in results["metadatas"] or []:
+            if not metadata:
+                continue
 
-        Returns
-        -------
-        list[dict]
-            Each item contains: source (str), topic (str), chunk_count (int).
-        """
-        # TODO: implement
-        # Query all metadata from the collection
-        # Group by metadata["source"] and count chunks per source
-        # Return sorted list of dicts
-        raise NotImplementedError
+            source = metadata.get("source")
+            if not source:
+                continue
+
+            if source not in documents:
+                documents[source] = {
+                    "source": source,
+                    "topic": metadata.get("topic", "unknown"),
+                    "chunk_count": 0,
+                }
+
+            documents[source]["chunk_count"] += 1
+
+        return [
+            documents[source]
+            for source in sorted(documents)
+        ]
 
     def get_document_chunks(self, source: str) -> list[DocumentChunk]:
         """

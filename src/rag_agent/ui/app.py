@@ -30,6 +30,14 @@ from rag_agent.agent.state import AgentResponse
 from rag_agent.config import get_settings
 from rag_agent.corpus.chunker import DocumentChunker
 from rag_agent.vectorstore.store import VectorStoreManager
+from tempfile import TemporaryDirectory
+from uuid import uuid4
+
+from langchain_core.messages import HumanMessage
+
+from rag_agent.agent.state import IngestionResult
+from rag_agent.config import LLMFactory
+from rag_agent.vectorstore.store import VectorStoreManager
 
 
 # ---------------------------------------------------------------------------
@@ -41,14 +49,9 @@ from rag_agent.vectorstore.store import VectorStoreManager
 
 
 @st.cache_resource
-def get_vector_store() -> VectorStoreManager:
-    """
-    Return the singleton VectorStoreManager.
-
-    Cached so ChromaDB connection is initialised once per application
-    session, not on every Streamlit rerun.
-    """
-    return VectorStoreManager()
+def get_llm():
+    """Create the LLM once and reuse it across reruns."""
+    return LLMFactory().create()
 
 
 @st.cache_resource
@@ -62,7 +65,9 @@ def get_graph():
     """Return the compiled LangGraph agent."""
     return get_compiled_graph()
 
-
+@st.cache_resource
+def get_vector_store() -> VectorStoreManager:
+    return VectorStoreManager()
 # ---------------------------------------------------------------------------
 # Session State Initialisation
 # ---------------------------------------------------------------------------
@@ -84,7 +89,7 @@ def initialise_session_state() -> None:
         "ingested_documents": [],     # list of dicts from list_documents()
         "selected_document": None,    # source filename currently in viewer
         "last_ingestion_result": None,
-        "thread_id": "default-session",  # LangGraph conversation thread
+        "thread_id": str(uuid4()),  # LangGraph conversation thread
         "topic_filter": None,
         "difficulty_filter": None,
     }
@@ -102,42 +107,91 @@ def render_ingestion_panel(
     store: VectorStoreManager,
     chunker: DocumentChunker,
 ) -> None:
-    """
-    Render the document ingestion panel in the sidebar.
-
-    Allows multi-file upload of PDF and Markdown files. Displays
-    ingestion results (chunks added, duplicates skipped, errors).
-    Updates the ingested documents list after successful ingestion.
-
-    Parameters
-    ----------
-    store : VectorStoreManager
-    chunker : DocumentChunker
-    """
+    """Upload, chunk, and ingest study materials."""
     st.sidebar.header("📂 Corpus Ingestion")
 
-    # TODO: implement
-    # 1. st.sidebar.file_uploader(
-    #        "Upload study materials",
-    #        type=["pdf", "md"],
-    #        accept_multiple_files=True
-    #    )
-    #
-    # 2. "Ingest Documents" button — only enabled when files are selected
-    #
-    # 3. On button click:
-    #    a. Save uploaded files to a temp directory
-    #    b. chunker.chunk_files(file_paths)
-    #    c. store.ingest(chunks) → IngestionResult
-    #    d. Display result: st.success / st.warning / st.error
-    #       Show: "{result.ingested} chunks added, {result.skipped} duplicates skipped"
-    #    e. Refresh ingested documents list in session_state
-    #
-    # 4. Render ingested documents list below the uploader
-    #    For each document: show source name, topic, chunk count
-    #    Add a small "🗑 Remove" button per document that calls store.delete_document()
+    uploads = st.sidebar.file_uploader(
+        "Upload study materials",
+        type=["pdf", "md"],
+        accept_multiple_files=True,
+    )
 
-    st.sidebar.info("Upload .pdf or .md files to populate the corpus.")
+    if st.sidebar.button(
+        "Ingest Documents",
+        disabled=not uploads,
+    ):
+        result = IngestionResult()
+
+        with st.spinner("Processing documents..."):
+            with TemporaryDirectory() as temp_dir:
+                for index, upload in enumerate(uploads):
+                    try:
+                        # Separate folders prevent filename collisions.
+                        folder = Path(temp_dir) / str(index)
+                        folder.mkdir()
+
+                        name = upload.name.replace("\\", "/").split("/")[-1]
+                        file_path = folder / name
+                        file_path.write_bytes(upload.getvalue())
+
+                        chunks = chunker.chunk_file(file_path)
+
+                        if not chunks:
+                            result.errors.append(
+                                f"{name}: No readable text found."
+                            )
+                            continue
+
+                        file_result = store.ingest(chunks)
+                        result.ingested += file_result.ingested
+                        result.skipped += file_result.skipped
+                        result.errors.extend(file_result.errors)
+
+                        for source in file_result.document_ids:
+                            if source not in result.document_ids:
+                                result.document_ids.append(source)
+
+                    except Exception as exc:
+                        result.errors.append(f"{upload.name}: {exc}")
+
+        st.session_state.last_ingestion_result = result
+
+    result = st.session_state.last_ingestion_result
+
+    if result is not None:
+        summary = (
+            f"{result.ingested} chunks added, "
+            f"{result.skipped} duplicates skipped"
+        )
+
+        if result.errors:
+            st.sidebar.warning(summary)
+            for error in result.errors:
+                st.sidebar.error(error)
+        elif result.ingested:
+            st.sidebar.success(summary)
+        else:
+            st.sidebar.info(summary)
+
+    documents = store.list_documents()
+    st.session_state.ingested_documents = documents
+
+    st.sidebar.subheader("Stored Documents")
+
+    for document in documents:
+        source = document["source"]
+
+        st.sidebar.write(
+            f"{source} — {document['topic']} "
+            f"({document['chunk_count']} chunks)"
+        )
+
+        if st.sidebar.button(
+            "🗑 Remove",
+            key=f"remove_document_{source}",
+        ):
+            store.delete_document(source)
+            st.rerun()
 
 
 def render_corpus_stats(store: VectorStoreManager) -> None:
@@ -205,61 +259,100 @@ def render_document_viewer(store: VectorStoreManager) -> None:
 
 
 def render_chat_interface(graph) -> None:
-    """
-    Render the chat interface in the right column.
-
-    Supports multi-turn conversation with the LangGraph agent.
-    Displays source citations with every response.
-    Shows a clear "no relevant context" indicator when the
-    hallucination guard fires.
-
-    Parameters
-    ----------
-    graph : CompiledStateGraph
-        The compiled LangGraph agent from get_compiled_graph().
-    """
+    """Display chat and submit questions to the RAG graph."""
     st.subheader("💬 Interview Prep Chat")
 
-    # Filters
     col_topic, col_diff = st.columns(2)
-    with col_topic:
-        # TODO: st.selectbox for topic filter
-        pass
-    with col_diff:
-        # TODO: st.selectbox for difficulty filter
-        pass
 
-    # Chat history display
+    with col_topic:
+        topic = st.selectbox(
+            "Topic",
+            [
+                "All", "ANN", "CNN", "RNN", "LSTM", "Seq2Seq",
+                "Autoencoder", "SOM", "BoltzmannMachine", "GAN",
+            ],
+        )
+
+    with col_diff:
+        difficulty = st.selectbox(
+            "Difficulty",
+            ["All", "beginner", "intermediate", "advanced"],
+        )
+
+    st.session_state.topic_filter = None if topic == "All" else topic
+    st.session_state.difficulty_filter = (
+        None if difficulty == "All" else difficulty
+    )
+
     chat_container = st.container(height=400)
+
     with chat_container:
         for message in st.session_state.chat_history:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
+
                 if message.get("sources"):
                     with st.expander("📎 Sources"):
                         for source in message["sources"]:
                             st.caption(source)
+
                 if message.get("no_context_found"):
-                    st.warning("⚠️ No relevant content found in corpus.")
+                    st.warning("No relevant content found in corpus.")
 
-    # Chat input
-    # TODO: implement
-    # 1. query = st.chat_input("Ask about a deep learning topic...")
-    #
-    # 2. On submit:
-    #    a. Append user message to chat_history
-    #    b. Display user message immediately (st.rerun or direct render)
-    #    c. Build LangGraph input:
-    #       {"messages": [HumanMessage(content=query)]}
-    #    d. config = {"configurable": {"thread_id": st.session_state.thread_id}}
-    #    e. result = graph.invoke(input, config=config)
-    #    f. response = result["final_response"]
-    #    g. Append assistant message with answer, sources, no_context_found flag
-    #
-    # STRETCH GOAL — streaming:
-    # Replace graph.invoke with graph.stream() and use st.write_stream()
-    # to display tokens as they arrive. Significant "wow factor" in Hour 3.
+    query = st.chat_input("Ask about a deep learning topic...")
 
+    if query:
+        st.session_state.chat_history.append(
+            {"role": "user", "content": query}
+        )
+
+        with chat_container:
+            with st.chat_message("user"):
+                st.markdown(query)
+
+        try:
+            with st.spinner("Searching your documents..."):
+                result = graph.invoke(
+                    {
+                        "messages": [HumanMessage(content=query)],
+                        "original_query": query,
+                        "rewritten_query": "",
+                        "retrieved_chunks": [],
+                        "no_context_found": False,
+                        "final_response": None,
+                        "topic_filter": st.session_state.topic_filter,
+                        "difficulty_filter": (
+                            st.session_state.difficulty_filter
+                        ),
+                    },
+                    config={
+                        "configurable": {
+                            "thread_id": st.session_state.thread_id
+                        }
+                    },
+                )
+
+                response = result.get("final_response")
+
+                if not isinstance(response, AgentResponse):
+                    raise RuntimeError(
+                        "The graph did not return an AgentResponse."
+                    )
+
+            st.session_state.chat_history.append(
+                {
+                    "role": "assistant",
+                    "content": response.answer,
+                    "sources": response.sources,
+                    "no_context_found": response.no_context_found,
+                }
+            )
+
+        except Exception as exc:
+            st.error(f"Could not generate an answer: {exc}")
+            return
+
+        st.rerun()
 
 # ---------------------------------------------------------------------------
 # Main Application
